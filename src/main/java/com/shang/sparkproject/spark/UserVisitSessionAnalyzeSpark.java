@@ -4,12 +4,17 @@ import com.alibaba.fastjson.JSONObject;
 import com.shang.sparkproject.conf.ConfigurationManager;
 import com.shang.sparkproject.constant.Constant;
 import com.shang.sparkproject.dao.ISessionAggrStatDAO;
+import com.shang.sparkproject.dao.IgetSessionRandomExtractDAO;
 import com.shang.sparkproject.dao.ItaskDao;
 import com.shang.sparkproject.dao.impl.DaoFactory;
 import com.shang.sparkproject.domain.SessionAggrStat;
+import com.shang.sparkproject.domain.SessionDetail;
+import com.shang.sparkproject.domain.SessionRandomExtract;
 import com.shang.sparkproject.domain.Task;
+import com.shang.sparkproject.jdbc.JdbcHelper;
 import com.shang.sparkproject.test.MockDataTest;
 import com.shang.sparkproject.util.*;
+import javolution.util.Index;
 import org.apache.spark.Accumulator;
 import org.apache.spark.SparkConf;
 import org.apache.spark.api.java.JavaPairRDD;
@@ -53,9 +58,11 @@ public class UserVisitSessionAnalyzeSpark {
         JavaPairRDD<String, String> filteredSessionid2AggrInfoRDD = filterSessionAndAggrStat(sessionid2AggrInfoRDD,
                 taskParam, sessionAggrStatAccumulator);
 
+        JavaPairRDD<String,Row> sessionid2actionRDD=getSessionid2ActionRDD(actionRDD);
+
 
         //随机抽取session，按照每个小时的平均抽取
-        randomExtractSession(task.getTaskid(), filteredSessionid2AggrInfoRDD);
+        randomExtractSession(task.getTaskid(),filteredSessionid2AggrInfoRDD,sessionid2actionRDD);
 
         // 计算出各个范围的session占比，并写入MySQL
         calculateAndPersistAggrStat(sessionAggrStatAccumulator.value(),
@@ -96,6 +103,18 @@ public class UserVisitSessionAnalyzeSpark {
         return userVisitRDD;
     }
 
+
+    /**
+     * 获取sessionid2到访问行为数据的映射的RDD
+     * @param actionRDD
+     * @return
+     */
+    public static JavaPairRDD<String,Row> getSessionid2ActionRDD(JavaRDD<Row> actionRDD){
+        return actionRDD.mapToPair(line->{
+            return new Tuple2<String,Row>(line.getString(2),line);
+        });
+    }
+
     /**
      * 对行为数据按session粒度进行聚合
      *
@@ -103,6 +122,7 @@ public class UserVisitSessionAnalyzeSpark {
      * @return session粒度聚合数据
      */
     public static JavaPairRDD<String, String> aggregateBysession(SQLContext sqlContext, JavaRDD<Row> actionRDD) {
+
         JavaPairRDD<String, Row> actionRDD2SessionRDD = actionRDD.mapToPair(row -> {
             String sessionid = row.getString(2);
             return new Tuple2<String, Row>(sessionid, row);
@@ -310,7 +330,8 @@ public class UserVisitSessionAnalyzeSpark {
             if (!ValidUtils.in(agginfo, Constant.FIELD_CLICK_CATEGORY_IDS, parameter,
                     Constant.PARAM_CATEGORY_IDS)) {
                 return false;
-            }// 如果经过了之前的多个过滤条件之后，程序能够走到这里
+            }
+            // 如果经过了之前的多个过滤条件之后，程序能够走到这里
             // 那么就说明，该session是通过了用户指定的筛选条件的，也就是需要保留的session
             // 那么就要对session的访问时长和访问步长，进行统计，根据session对应的范围
             // 进行相应的累加计数
@@ -339,7 +360,9 @@ public class UserVisitSessionAnalyzeSpark {
      * @param filteredSessionid2AggrInfoRDD
      */
 
-    private static void randomExtractSession(long taskid, JavaPairRDD<String, String> filteredSessionid2AggrInfoRDD) {
+    private static void randomExtractSession(long taskid,
+                                             JavaPairRDD<String, String> filteredSessionid2AggrInfoRDD,
+                                             JavaPairRDD<String,Row> sessionid2actionRDD ) {
 
         // 获取<yyyy-MM-dd_HH,aggrInfo>格式的RDD
         JavaPairRDD<String, String> time2sessionidRDD = filteredSessionid2AggrInfoRDD.mapToPair(line -> {
@@ -418,7 +441,7 @@ public class UserVisitSessionAnalyzeSpark {
                 for (int i = 0; i <= hourExtractNumber; i++) {
                     int index = random.nextInt(hourExtractNumber);
                     while (extractIndexList.contains(index)) {
-                        index = random.nextInt((int) count);
+                        index = random.nextInt((int) hourExtractNumber);
                     }
                     extractIndexList.add(index);
                 }
@@ -432,7 +455,70 @@ public class UserVisitSessionAnalyzeSpark {
         // 执行groupByKey算子，得到<dateHour,(session aggrInfo)>
         JavaPairRDD<String, Iterable<String>> time2sessionsRDD = time2sessionidRDD.groupByKey();
 
+        // 我们用flatMap算子，遍历所有的<dateHour,(session aggrInfo)>格式的数据
+        // 然后呢，会遍历每天每小时的session
+        // 如果发现某个session恰巧在我们指定的这天这小时的随机抽取索引上
+        // 那么抽取该session，直接写入MySQL的random_extract_session表
+        // 将抽取出来的session id返回回来，形成一个新的JavaRDD<String>
+        // 然后最后一步，是用抽取出来的sessionid，去join它们的访问行为明细数据，写入session表
 
+        JavaPairRDD<String, String> extractSessionidsRDD = time2sessionsRDD.flatMapToPair(line -> {
+            List<Tuple2<String, String>> extractSessionids =
+                    new ArrayList<Tuple2<String, String>>();
+            String dateHour = line._1;
+            String date = dateHour.split("_")[0];
+            String hour = dateHour.split("_")[1];
+            Iterator<String> iterator = line._2.iterator();
+
+            List<Integer> extractIndexList = dateHourExtractMap.get(date).get(hour);
+            IgetSessionRandomExtractDAO getSessionRandomExtractDAO = DaoFactory.getSessionRandomExtractDAO();
+
+            int index = 0;
+            while (iterator.hasNext()) {
+                String sessionAggrInfo = iterator.next();
+                if (extractIndexList.contains(index)) {
+                    String sessionid = StringUtils.getFieldFromConcatString(sessionAggrInfo, "\\|",
+                            Constant.FIELD_SESSION_ID);
+                    SessionRandomExtract sessionRandomExtract = new SessionRandomExtract();
+                    sessionRandomExtract.setTaskid(taskid);
+                    sessionRandomExtract.setSessionid(sessionid);
+                    sessionRandomExtract.setStartTime(StringUtils.getFieldFromConcatString(sessionAggrInfo,
+                            "\\|", Constant.FIELD_START_TIME));
+                    sessionRandomExtract.setSearchKeywords(StringUtils.getFieldFromConcatString(sessionAggrInfo, "\\|",
+                            Constant.FIELD_SEARCH_KEYWORDS));
+                    sessionRandomExtract.setClickCategoryIds(StringUtils.getFieldFromConcatString(sessionAggrInfo, "\\|",
+                            Constant.FIELD_CLICK_CATEGORY_IDS));
+                    getSessionRandomExtractDAO.insert(sessionRandomExtract);
+                    extractSessionids.add(new Tuple2<String, String>(sessionid, sessionid));
+                }
+                index++;
+            }
+            return extractSessionids;
+        });
+
+        /**
+         * 第四步：获取抽取出来的session的明细数据
+         */
+        JavaPairRDD<String,Tuple2<String,Row>> extractSessionDetailRDD=extractSessionidsRDD.join(sessionid2actionRDD);
+        extractSessionDetailRDD.foreach(line->{
+            Row row=line._2._2;
+
+            SessionDetail sessionDetail = new SessionDetail();
+            sessionDetail.setTaskid(taskid);
+            sessionDetail.setUserid(row.getLong(0));
+            sessionDetail.setSessionid(row.getString(1));
+            sessionDetail.setPageid(row.getLong(2));
+            sessionDetail.setActionTime(row.getString(3));
+            sessionDetail.setSearchKeyword(row.getString(4));
+            sessionDetail.setClickCategoryId(row.getLong(5));
+            sessionDetail.setClickProductId(row.getLong(6));
+            sessionDetail.setOrderCategoryIds(row.getString(7));
+            sessionDetail.setOrderProductIds(row.getString(8));
+            sessionDetail.setPayCategoryIds(row.getString(9));
+            sessionDetail.setPayProductIds(row.getString(11));
+
+            DaoFactory.getSessionDetailDAO().insert(sessionDetail);
+        });
     }
 
 
