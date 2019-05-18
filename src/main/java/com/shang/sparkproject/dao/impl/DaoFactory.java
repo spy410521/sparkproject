@@ -1,9 +1,6 @@
 package com.shang.sparkproject.dao.impl;
 
-import com.shang.sparkproject.dao.ISessionAggrStatDAO;
-import com.shang.sparkproject.dao.ISessionDetailDAO;
-import com.shang.sparkproject.dao.IgetSessionRandomExtractDAO;
-import com.shang.sparkproject.dao.ItaskDao;
+import com.shang.sparkproject.dao.*;
 
 public class DaoFactory {
 
@@ -21,5 +18,9 @@ public class DaoFactory {
 
     public static ISessionDetailDAO getSessionDetailDAO(){
         return  new SessionDetailDAOImple();
+    }
+
+    public static ITop10CategoryDAO getTop10CategoryDAO(){
+        return  new top10CategoryDAOImpl();
     }
 }
