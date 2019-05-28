@@ -50,7 +50,24 @@ public class DateUtils {
 	}
 
 
+	private static final  SimpleDateFormat getDateMinFormat(){
+		SimpleDateFormat dateMinFormat=messageFormat.get();
+		if(dateMinFormat==null){
+			dateMinFormat=new SimpleDateFormat("yyyyMMddHHmm");
+		}
+		return dateMinFormat;
+	}
 
+
+	/**
+	 * 格式化时间，保留到分钟级别
+	 * yyyyMMddHHmm
+	 * @param date
+	 * @return
+	 */
+	public static String getDateMinFortmat(Date date){
+		return getDateMinFormat().format(date);
+	}
 	/**
 	 * 判断一个时间是否在另一个时间之前
 	 * @param time1 第一个时间

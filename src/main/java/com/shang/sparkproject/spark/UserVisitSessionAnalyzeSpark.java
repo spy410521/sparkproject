@@ -4,16 +4,12 @@ import com.alibaba.fastjson.JSONObject;
 import com.google.common.base.Optional;
 import com.shang.sparkproject.conf.ConfigurationManager;
 import com.shang.sparkproject.constant.Constant;
-import com.shang.sparkproject.dao.ISessionAggrStatDAO;
-import com.shang.sparkproject.dao.ITop10CategoryDAO;
-import com.shang.sparkproject.dao.IgetSessionRandomExtractDAO;
-import com.shang.sparkproject.dao.ItaskDao;
+import com.shang.sparkproject.dao.*;
 import com.shang.sparkproject.dao.impl.DaoFactory;
 import com.shang.sparkproject.domain.*;
 import com.shang.sparkproject.jdbc.JdbcHelper;
 import com.shang.sparkproject.test.MockDataTest;
 import com.shang.sparkproject.util.*;
-import org.apache.hadoop.hdfs.protocol.DirectoryListing;
 import org.apache.spark.Accumulator;
 import org.apache.spark.SparkConf;
 import org.apache.spark.api.java.JavaPairRDD;
@@ -24,7 +20,6 @@ import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SQLContext;
 import org.apache.spark.sql.hive.HiveContext;
 import scala.Tuple2;
-import scala.tools.nsc.javac.JavaScanners;
 
 import java.util.*;
 
@@ -73,9 +68,13 @@ public class UserVisitSessionAnalyzeSpark {
         List<Tuple2<CategorySortKey, String>> top10CategoryList =
                 getTop10Category(task.getTaskid(), sessionid2detailRDD);
 
+        //获取top10活跃session
+        getTop10Session(sc, task.getTaskid(), top10CategoryList, sessionid2detailRDD);
+
 
         sc.close();
     }
+
 
     /**
      * 获取top10热门品类
@@ -194,6 +193,7 @@ public class UserVisitSessionAnalyzeSpark {
             top10Category.setClickCount(clickCount);
             top10Category.setOrderCount(orderCount);
             top10Category.setPayCount(payCount);
+
             iTop10CategoryDAO.insert(top10Category);
         }
 
@@ -452,7 +452,7 @@ public class UserVisitSessionAnalyzeSpark {
                 }
 
                 Date actionTime = null;
-                if ((!row.isNullAt(4)) && (!row.getString(4).equals(""))) {
+                if (!row.isNullAt(4)) {
                     actionTime = DateUtils.parseTime(row.getString(4));
                 }
                 if (startTime == null) {
@@ -946,6 +946,166 @@ public class UserVisitSessionAnalyzeSpark {
         // 调用对应的DAO插入统计结果
         ISessionAggrStatDAO sessionAggrStatDAO = DaoFactory.getSessionAggrStatDAO();
         sessionAggrStatDAO.insert(sessionAggrStat);
+    }
+
+
+    //**
+    //	 * 获取top10活跃session
+    //	 * @param taskid
+    //	 * @param sessionid2detailRDD
+    //	 */
+    private static void getTop10Session(JavaSparkContext sc, long taskid,
+                                        List<Tuple2<CategorySortKey, String>> top10CategoryList,
+                                        JavaPairRDD<String, Row> sessionid2detailRDD) {
+
+        /**
+         * 第一步：将top10热门品类的id，生成一份RDD
+         */
+        List<Tuple2<Long, Long>> top10CategoryIdList = new ArrayList<Tuple2<Long, Long>>();
+        for (Tuple2<CategorySortKey, String> tuple2 : top10CategoryList) {
+            String categoryIdTmp = tuple2._2;
+            long categoryId = Long.valueOf(StringUtils.getFieldFromConcatString(categoryIdTmp, "\\|",
+                    Constant.FIELD_CATEGORY_ID));
+            top10CategoryIdList.add(new Tuple2<Long, Long>(categoryId, categoryId));
+        }
+
+        JavaPairRDD<Long, Long> top10CategoryIdRDD = sc.parallelizePairs(top10CategoryIdList);
+
+
+        /**
+         * 第二步：计算top10品类被各session点击的次数
+         */
+        JavaPairRDD<String, Iterable<Row>> sessionid2detailsRDD = sessionid2detailRDD.groupByKey();
+
+        JavaPairRDD<Long, String> categoryid2sessionCountRDD = sessionid2detailsRDD.flatMapToPair(line -> {
+            String sessionid = line._1;
+            Iterator<Row> iterator = line._2.iterator();
+
+
+            Map<Long, Long> categoryCountMap = new HashMap<Long, Long>();
+            // 计算出该session，对每个品类的点击次数
+            while (iterator.hasNext()) {
+                Row row = iterator.next();
+                if (!row.isNullAt(6)) {
+                    long categoryid = row.getLong(6);
+                    Long count = categoryCountMap.get(categoryid);
+                    if (count == null) {
+                        count = 0L;
+                    }
+                    count++;
+                    categoryCountMap.put(categoryid, count);
+                }
+            }
+
+            // 返回结果，<categoryid, sessionid,count>格式
+            List<Tuple2<Long, String>> list = new ArrayList<Tuple2<Long, String>>();
+            for (Map.Entry<Long, Long> entry : categoryCountMap.entrySet()) {
+                Long categoryid = entry.getKey();
+                Long count = entry.getValue();
+                String value = sessionid + "," + count;
+                list.add(new Tuple2<>(categoryid, value));
+            }
+            return list;
+
+        });
+
+        // 获取到to10热门品类，被各个session点击的次数
+        JavaPairRDD<Long, String> top10CategorySessionCountRDD = categoryid2sessionCountRDD.join(top10CategoryIdRDD)
+                .mapToPair(line -> {
+                    return new Tuple2<Long, String>(line._1, line._2._1);
+                });
+
+        /**
+         * 第三步：分组取TopN算法实现，获取每个品类的top10活跃用户
+         */
+        JavaPairRDD<Long, Iterable<String>> top10CategorySessionCountsRDD =
+                top10CategorySessionCountRDD.groupByKey();
+
+        JavaPairRDD<String, String> top10SessionRDD = top10CategorySessionCountsRDD.flatMapToPair(line -> {
+            long categoryid = line._1;
+            Iterator<String> iterator = line._2.iterator();
+
+            // 定义取topn的排序数组
+            String[] top10Sessions = new String[10];
+
+            while (iterator.hasNext()) {
+                String sessionCount = iterator.next();
+                long count = Long.valueOf(sessionCount.split(",")[1]);
+
+                for (int i = 0; i < top10Sessions.length; i++) {
+                    if (top10Sessions[i] == null) {
+                        top10Sessions[i] = sessionCount;
+                        break;
+                    } else {
+                        long _count = Long.valueOf(top10Sessions[i].split(",")[1]);
+
+                        // 如果sessionCount比i位的sessionCount要大
+                        if (count > _count) {
+                            // 从排序数组最后一位开始，到i位，所有数据往后挪一位
+                            for (int j = 9; j > i; j--) {
+                                top10Sessions[j] = top10Sessions[j - 1];
+                            }
+                            // 将i位赋值为sessionCount
+                            top10Sessions[i] = sessionCount;
+                            break;
+                        }
+
+                    }
+                }
+
+            }
+
+            // 将数据写入MySQL表
+            List<Tuple2<String, String>> list = new ArrayList<>();
+            for (String sessionCount : top10Sessions) {
+                String sessionid = sessionCount.split(",")[0];
+                long count = Long.valueOf(sessionCount.split(",")[1]);
+
+                //写入mysql表
+                Top10Session top10Session = new Top10Session();
+                top10Session.setTaskid(taskid);
+                top10Session.setCategoryid(categoryid);
+                top10Session.setSessionid(sessionid);
+                top10Session.setClickCount(count);
+
+                ITop10SessionDAO iTop10SessionDAO = DaoFactory.getTop10SessionDAO();
+                iTop10SessionDAO.insert(top10Session);
+
+                list.add(new Tuple2<>(sessionid, sessionid));
+
+            }
+
+            // 放入list
+            return list;
+
+        });
+
+        /**
+         * 第四步：获取top10活跃session的明细数据，并写入MySQL
+         */
+        JavaPairRDD<String, Tuple2<String, Row>> sessionDetailRDD = top10SessionRDD.join(sessionid2detailRDD);
+        sessionDetailRDD.foreach(line->{
+            Row row=line._2._2;
+
+            SessionDetail sessionDetail=new SessionDetail();
+            sessionDetail.setTaskid(taskid);
+            sessionDetail.setUserid(row.getLong(1));
+            sessionDetail.setSessionid(row.getString(2));
+            sessionDetail.setPageid(row.getLong(3));
+            sessionDetail.setActionTime(row.getString(4));
+            sessionDetail.setSearchKeyword(row.getString(5));
+            sessionDetail.setClickCategoryId(row.getLong(6));
+            sessionDetail.setClickProductId(row.getLong(7));
+            sessionDetail.setOrderCategoryIds(row.getString(8));
+            sessionDetail.setOrderProductIds(row.getString(9));
+            sessionDetail.setPayCategoryIds(row.getString(10));
+            sessionDetail.setPayProductIds(row.getString(11));
+
+            ISessionDetailDAO sessionDetailDAO=DaoFactory.getSessionDetailDAO();
+            sessionDetailDAO.insert(sessionDetail);
+        });
+
+
     }
 
 }

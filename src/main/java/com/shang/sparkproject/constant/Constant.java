@@ -60,5 +60,9 @@ public interface Constant {
     String STEP_PERIOD_60 = "60";
 
 
+    String KAFKA_METADATA_BROKER_LIST = "kafka.metadata.broker.list";
+    String KAFKA_TOPICS = "kafka.topics";
+
+
 }
 

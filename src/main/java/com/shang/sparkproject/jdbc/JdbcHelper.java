@@ -123,28 +123,31 @@ public class JdbcHelper {
     }
 
 
-    //执行批量查询的方法
-    public  int[] executeBash(String sql, List<Object[]> paramsList) {
-        int[] rst=null;
-        Connection conn=null;
-        PreparedStatement psmt=null;
+    //执行批量插入的方法
+    public int[] executeBash(String sql, List<Object[]> paramsList) {
+        int[] rst = null;
+        Connection conn = null;
+        PreparedStatement psmt = null;
 
         try {
-            conn=getConnection();
+            conn = getConnection();
             conn.setAutoCommit(false);
-            psmt=conn.prepareStatement(sql);
-            for(Object[] objs:paramsList){
-                for(int i=0;i<objs.length;i++){
-                    psmt.setObject(i+1,objs[i]);
+            psmt = conn.prepareStatement(sql);
+            for (Object[] objs : paramsList) {
+                for (int i = 0; i < objs.length; i++) {
+                    psmt.setObject(i + 1, objs[i]);
                 }
                 psmt.addBatch();
             }
-             rst=psmt.executeBatch();
+            rst = psmt.executeBatch();
 
             conn.commit();
         } catch (Exception e) {
             e.printStackTrace();
         } finally {
+            if(conn!=null){
+                datasource.push(conn);
+            }
         }
 
         return null;
